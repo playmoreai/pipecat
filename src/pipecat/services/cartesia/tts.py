@@ -17,15 +17,18 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from pipecat.frames.frames import (
+    AggregationType,
     CancelFrame,
     EndFrame,
     ErrorFrame,
     Frame,
     InterruptionFrame,
+    LLMFullResponseEndFrame,
     StartFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
+    TTSTextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import AudioContextWordTTSService, TTSService
@@ -360,30 +363,30 @@ class CartesiaTTSService(AudioContextWordTTSService):
         """Convenience method to create a speed tag."""
         return f'<speed ratio="{speed}" />'
 
-    def _is_cjk_language(self, language: str) -> bool:
-        """Check if the given language is CJK (Chinese, Japanese, Korean).
+    def _is_chinese_or_japanese_language(self, language: str) -> bool:
+        """Check if the given language is Chinese or Japanese.
 
         Args:
             language: The language code to check.
 
         Returns:
-            True if the language is Chinese, Japanese, or Korean.
+            True if the language is Chinese or Japanese.
         """
-        cjk_languages = {"zh", "ja", "ko"}
         base_lang = language.split("-")[0].lower()
-        return base_lang in cjk_languages
+        return base_lang in {"zh", "ja"}
 
     def _process_word_timestamps_for_language(
         self, words: List[str], starts: List[float]
     ) -> List[tuple[str, float]]:
         """Process word timestamps based on the current language.
 
-        For CJK languages, Cartesia groups related characters in the same timestamp message.
+        For Chinese and Japanese, Cartesia groups related characters in the same timestamp
+        message.
         For example, in Japanese a single message might be `['こ', 'ん', 'に', 'ち', 'は', '。']`.
         We combine these into single words so the downstream aggregator can add natural
         spacing between meaningful units rather than individual characters.
 
-        For non-CJK languages, words are already properly separated and are used as-is.
+        For other languages, words are already properly separated and are used as-is.
 
         Args:
             words: List of words/characters from Cartesia.
@@ -394,10 +397,10 @@ class CartesiaTTSService(AudioContextWordTTSService):
         """
         current_language = self._settings.get("language")
 
-        # Check if this is a CJK language (if language is None, treat as non-CJK)
-        if current_language and self._is_cjk_language(current_language):
-            # For CJK languages, combine all characters in this message into one word
-            # using the first character's start time
+        # Check if this is a Chinese/Japanese language (if language is None, treat as other)
+        if current_language and self._is_chinese_or_japanese_language(current_language):
+            # For Chinese/Japanese, combine all characters in this message into one word
+            # using the first character's start time.
             if words and starts:
                 combined_word = "".join(words)
                 first_start = starts[0]
@@ -407,6 +410,36 @@ class CartesiaTTSService(AudioContextWordTTSService):
         else:
             # For non-CJK languages, use as-is
             return list(zip(words, starts))
+
+    def _word_timestamps_include_inter_frame_spaces(self) -> bool:
+        """Whether timestamp text should be treated as carrying its own spacing."""
+        current_language = self._settings.get("language")
+        return bool(current_language and self._is_chinese_or_japanese_language(current_language))
+
+    async def _words_task_handler(self):
+        last_pts = 0
+        while True:
+            frame = None
+            (word, timestamp) = await self._words_queue.get()
+            if word == "Reset" and timestamp == 0:
+                await self.reset_word_timestamps()
+                if self._llm_response_started:
+                    self._llm_response_started = False
+                    frame = LLMFullResponseEndFrame()
+                    frame.pts = last_pts
+            elif word == "TTSStoppedFrame" and timestamp == 0:
+                frame = TTSStoppedFrame()
+                frame.pts = last_pts
+            else:
+                frame = TTSTextFrame(word, aggregated_by=AggregationType.WORD)
+                frame.includes_inter_frame_spaces = (
+                    self._word_timestamps_include_inter_frame_spaces()
+                )
+                frame.pts = self._initial_word_timestamp + timestamp
+            if frame:
+                last_pts = frame.pts
+                await self.push_frame(frame)
+            self._words_queue.task_done()
 
     def _build_msg(
         self, text: str = "", continue_transcript: bool = True, add_timestamps: bool = True

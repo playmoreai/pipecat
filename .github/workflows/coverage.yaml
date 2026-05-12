@@ -36,6 +36,7 @@ jobs:
           uv sync --group dev \
             --extra anthropic \
             --extra aws \
+            --extra cartesia \
             --extra google \
             --extra langchain \
             --extra livekit \
